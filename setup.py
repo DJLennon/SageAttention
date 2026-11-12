@@ -47,18 +47,39 @@ if not SKIP_CUDA_BUILD:
     # Supported NVIDIA GPU architectures.
     SUPPORTED_ARCHS = {"8.0", "8.6", "8.9", "9.0", "10.0", "12.0", "12.1"}
 
+    IS_WINDOWS = sys.platform == "win32"
+
     # Compiler flags.
-    CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
-    NVCC_FLAGS = [
-        "-O3",
-        "-std=c++17",
-        "-U__CUDA_NO_HALF_OPERATORS__",
-        "-U__CUDA_NO_HALF_CONVERSIONS__",
-        "--use_fast_math",
-        "--threads=8",
-        "-Xptxas=-v",
-        "-diag-suppress=174",
-    ]
+    if IS_WINDOWS:
+        # MSVC does not understand the GCC-style flags used on Linux (-g, -O3,
+        # -fopenmp, -lgomp, -std=...). PyTorch's BuildExtension already adds the
+        # language standard it requires (/std:c++20 for cl, -std=c++20 for nvcc),
+        # so no -std flag is set here. /Zc:preprocessor is required by the CCCL
+        # headers shipped with recent CUDA toolkits, and /Zc:__cplusplus makes
+        # MSVC report the real C++ standard in the __cplusplus macro.
+        CXX_FLAGS = ["/O2", "/Zc:preprocessor", "/Zc:__cplusplus", "-DENABLE_BF16"]
+        NVCC_FLAGS = [
+            "-O3",
+            "-Xcompiler", "/Zc:preprocessor",
+            "-Xcompiler", "/Zc:__cplusplus",
+            "-U__CUDA_NO_HALF_OPERATORS__",
+            "-U__CUDA_NO_HALF_CONVERSIONS__",
+            "--use_fast_math",
+            "--threads=8",
+            "-diag-suppress=174",
+        ]
+    else:
+        CXX_FLAGS = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
+        NVCC_FLAGS = [
+            "-O3",
+            "-std=c++17",
+            "-U__CUDA_NO_HALF_OPERATORS__",
+            "-U__CUDA_NO_HALF_CONVERSIONS__",
+            "--use_fast_math",
+            "--threads=8",
+            "-Xptxas=-v",
+            "-diag-suppress=174",
+        ]
 
     # Append flags from env if provided
     cxx_append = os.getenv("CXX_APPEND_FLAGS", "").strip()
@@ -68,9 +89,11 @@ if not SKIP_CUDA_BUILD:
     if nvcc_append:
         NVCC_FLAGS += nvcc_append.split()
 
-    ABI = 1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0
-    CXX_FLAGS += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}"]
-    NVCC_FLAGS += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}"]
+    if not IS_WINDOWS:
+        # libstdc++ ABI flag; meaningless with MSVC.
+        ABI = 1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0
+        CXX_FLAGS += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}"]
+        NVCC_FLAGS += [f"-D_GLIBCXX_USE_CXX11_ABI={ABI}"]
 
     if CUDA_HOME is None:
         raise RuntimeError(
@@ -210,7 +233,8 @@ if not SKIP_CUDA_BUILD:
                     "csrc/qattn/qk_int_sv_f8_cuda_sm90.cu",
                 ],
                 extra_compile_args={"cxx": CXX_FLAGS, "nvcc": NVCC_FLAGS},
-                extra_link_args=['-lcuda'],
+                # Link against the CUDA driver API (cuda.lib on Windows, libcuda.so on Linux).
+                **({"libraries": ["cuda"]} if IS_WINDOWS else {"extra_link_args": ['-lcuda']}),
             )
         )
 
@@ -237,6 +261,14 @@ if not SKIP_CUDA_BUILD:
     # Defaults if not provided
     if parallel is None:
         parallel = 4
+    if IS_WINDOWS:
+        # On Windows, PyTorch's BuildExtension temporarily monkey-patches the shared
+        # compiler object per extension (to inject flags such as
+        # -DTORCH_EXTENSION_NAME). Building extensions in parallel threads races on
+        # that patch and mixes up flags between extensions, so build them one at a
+        # time. Sources within each extension are still compiled in parallel by
+        # ninja (MAX_JOBS) when ninja is installed.
+        parallel = 1
     # Ensure MAX_JOBS for underlying tooling if not explicitly set
     os.environ.setdefault('MAX_JOBS', '32')
 
